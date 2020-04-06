@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -183,8 +184,8 @@ func getProcessorsForFunction(client service.Dashboard, function *unstructured.U
 // the plugin.
 func handleNavigation(request *service.NavigationRequest) (navigation.Navigation, error) {
 	return navigation.Navigation{
-		Title: "riff Plugin",
-		Path:  request.GeneratePath(),
+		Title:    "riff Plugin",
+		Path:     request.GeneratePath(),
 		IconName: "cloud",
 	}, nil
 }
@@ -195,40 +196,65 @@ func initRoutes(router *service.Router) {
 
 	router.HandleFunc("*", func(request service.Request) (component.ContentResponse, error) {
 
-		card := component.NewCard([]component.TitleComponent{component.NewText("functions")})
+		card := component.NewCard([]component.TitleComponent{component.NewText("riff workloads")})
 
-		processorGVK := schema.GroupVersionKind{Group: "streaming.projectriff.io", Version: "v1alpha1", Kind: "Processor"}
-		processorKey := store.KeyFromGroupVersionKind(processorGVK)
-		l, err := request.DashboardClient().List(context.Background(), processorKey)
+		processorList, err := listProcessors(request)
 		if err != nil {
 			return component.ContentResponse{}, err
 		}
-		functions := map[string]bool{}
+		functions := make(map[string]struct{})
 		table := component.NewTable("Functions", "placeholder",
 			[]component.TableCol{
-				component.TableCol{Name: "function"},
-				component.TableCol{Name: "processor"},
-				component.TableCol{Name: "input streams"},
-				component.TableCol{Name: "output streams"},
+				{Name: "function"},
+				{Name: "processor"},
+				{Name: "input streams"},
+				{Name: "output streams"},
 			})
 
-		sortedList := sortUnstructuredList(l.Items)
-		for _, i := range sortedList {
-			funcName, found, err := unstructured.NestedString(i.UnstructuredContent(), "spec", "build", "functionRef")
+		var processorNodeNames []string
+		uniqueStreamNames := make(map[string]struct{})
+		graphVizBuilder := strings.Builder{}
+		graphVizBuilder.WriteString("digraph riff {\n\tnode [shape=record, style=\"bold\"];\n\tedge [fontsize=8];\n\t\n\trankdir=\"LR\";\n\n")
+		processors := sortUnstructuredList(processorList.Items)
+		for _, processor := range processors {
+			funcName, found, err := unstructured.NestedString(processor.UnstructuredContent(), "spec", "build", "functionRef")
 			if err != nil || !found {
 				funcName = "NOT FOUND"
 			}
-			inStreamStr := getStreamNames(i, "spec", "inputs")
-			outStreamStr := getStreamNames(i, "spec", "outputs")
+			processorNamespace := processor.GetNamespace()
+			processorName := processor.GetName()
+			processorNodeName := fmt.Sprintf("\"processor_%s_%s\"", processorNamespace, processorName)
+			graphVizBuilder.WriteString(fmt.Sprintf("\t%s [label=\"[%s] %s processor\"];\n", processorNodeName, processorNamespace, processorName))
+			inputStreamNames := getStreamNames(processor, "spec", "inputs")
+			for _, inputStream := range inputStreamNames {
+				namespacedInputStream := fmt.Sprintf("%s_%s", processorNamespace, inputStream)
+				streamNodeName := fmt.Sprintf("\"stream_%s\"", namespacedInputStream)
+				if _, exists := uniqueStreamNames[namespacedInputStream]; !exists {
+					graphVizBuilder.WriteString(fmt.Sprintf("\t%s [label=\"[%s] %s\", shape=point];\n", streamNodeName, processorNamespace, inputStream))
+					uniqueStreamNames[namespacedInputStream] = struct{}{}
+				}
+				graphVizBuilder.WriteString(fmt.Sprintf("\t%s -> %s [label=\"%s\" splines=curved color=green];\n", streamNodeName, processorNodeName, inputStream))
+			}
+			outputStreamNames := getStreamNames(processor, "spec", "outputs")
+			for _, outputStream := range outputStreamNames {
+				namespacedOutputStream := fmt.Sprintf("%s_%s", processorNamespace, outputStream)
+				streamNodeName := fmt.Sprintf("\"stream_%s\"", namespacedOutputStream)
+				if _, exists := uniqueStreamNames[namespacedOutputStream]; !exists {
+					graphVizBuilder.WriteString(fmt.Sprintf("\t%s [label=\"[%s] %s\", shape=point];\n", streamNodeName, processorNamespace, outputStream))
+					uniqueStreamNames[namespacedOutputStream] = struct{}{}
+				}
+				graphVizBuilder.WriteString(fmt.Sprintf("\t%s -> %s [label=\"%s\" splines=curved color=red];\n", processorNodeName, streamNodeName, outputStream))
+			}
 			table.Add(component.TableRow{
-				"function":      component.NewText(funcName),
-				"processor":     component.NewText(i.GetName()),
-				"input streams": component.NewText(fmt.Sprintf("%s", inStreamStr)),
-				"output streams": component.NewText(fmt.Sprintf("%s", outStreamStr)),
+				"function":       component.NewText(funcName),
+				"processor":      component.NewText(processorName),
+				"input streams":  component.NewText(fmt.Sprintf("%s", inputStreamNames)),
+				"output streams": component.NewText(fmt.Sprintf("%s", outputStreamNames)),
 			})
-			functions[funcName] = true
+			functions[funcName] = struct{}{}
+			processorNodeNames = append(processorNodeNames, processorNodeName)
 		}
-
+		graphVizBuilder.WriteString(fmt.Sprintf("\t{ rank=same; %s }\n}", strings.Join(processorNodeNames, ";")))
 		allFunctions := getFunctions(request.DashboardClient())
 		for fi := range allFunctions {
 			if _, ok := functions[allFunctions[fi]]; !ok {
@@ -237,13 +263,25 @@ func initRoutes(router *service.Router) {
 				})
 			}
 		}
-
 		card.SetBody(table)
+
 		contentResponse := component.NewContentResponse(component.TitleFromString("riff Components"))
-		contentResponse.Add(card)
+		//contentResponse.Add(card)
+		graphviz := graphVizBuilder.String()
+		fmt.Println(graphviz)
+		contentResponse.Add(component.NewGraphviz(graphviz))
 
 		return *contentResponse, nil
 	})
+}
+
+func listProcessors(request service.Request) (*unstructured.UnstructuredList, error) {
+	key := store.KeyFromGroupVersionKind(schema.GroupVersionKind{
+		Group:   "streaming.projectriff.io",
+		Version: "v1alpha1",
+		Kind:    "Processor",
+	})
+	return request.DashboardClient().List(context.Background(), key)
 }
 
 func sortUnstructuredList(items []unstructured.Unstructured) []unstructured.Unstructured {
